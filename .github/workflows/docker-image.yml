@@ -1,4 +1,4 @@
-name: Docker Image
+name: Backend CI/CD
 
 on:
   push:
@@ -12,6 +12,13 @@ on:
 permissions:
   contents: read
   packages: write
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository }}
+  APP_DIR: /opt/alphapayy
+  CONTAINER_NAME: alphapayy-api
+  CONTAINER_PORT: "8090"
+  HOST_PORT: "8090"
 
 jobs:
   build:
@@ -36,14 +43,15 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/${{ github.repository }}
+          images: ${{ env.IMAGE_NAME }}
           tags: |
             type=ref,event=branch
             type=ref,event=pr
-            type=sha,prefix=sha-
+            type=sha,format=long,prefix=sha-
             type=raw,value=latest,enable={{is_default_branch}}
 
       - name: Build and optionally push
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -52,3 +60,106 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  deploy:
+    name: Deploy to Instagram VM
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    environment: production
+
+    env:
+      DEPLOY_HOST: ${{ secrets.PROD_SSH_HOST }}
+      DEPLOY_USER: ${{ secrets.PROD_SSH_USER }}
+      DEPLOY_PORT: ${{ secrets.PROD_SSH_PORT || '22' }}
+      DEPLOY_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
+      PROD_ENV_B64: ${{ secrets.PROD_ENV_B64 }}
+      IMAGE_TAG: ghcr.io/${{ github.repository }}:sha-${{ github.sha }}
+
+    steps:
+      - name: Validate deployment secrets
+        run: |
+          test -n "$DEPLOY_HOST"
+          test -n "$DEPLOY_USER"
+          test -n "$DEPLOY_PORT"
+          test -n "$DEPLOY_SSH_KEY"
+          test -n "$PROD_ENV_B64"
+
+      - name: Configure SSH
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -p "$DEPLOY_PORT" "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+
+      - name: Upload environment file
+        run: |
+          printf '%s' "$PROD_ENV_B64" | base64 -d > /tmp/alphapayy.env
+          chmod 600 /tmp/alphapayy.env
+          scp -i ~/.ssh/deploy_key -P "$DEPLOY_PORT" /tmp/alphapayy.env "$DEPLOY_USER@$DEPLOY_HOST:/tmp/alphapayy.env"
+
+      - name: Log in to GHCR on server
+        run: |
+          printf '%s' "${{ secrets.GITHUB_TOKEN }}" | ssh -i ~/.ssh/deploy_key -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" \
+            "sudo docker login ghcr.io -u '${{ github.actor }}' --password-stdin"
+
+      - name: Roll out container
+        run: |
+          ssh -i ~/.ssh/deploy_key -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" 'bash -s' <<REMOTE
+          set -Eeuo pipefail
+
+          app_dir="${APP_DIR}"
+          container_name="${CONTAINER_NAME}"
+          next_container="\${container_name}-next"
+          image_tag="${IMAGE_TAG}"
+          host_port="${HOST_PORT}"
+          container_port="${CONTAINER_PORT}"
+
+          sudo mkdir -p "\$app_dir"
+          sudo install -m 600 /tmp/alphapayy.env "\$app_dir/.env"
+          rm -f /tmp/alphapayy.env
+
+          sudo docker pull "\$image_tag"
+          sudo docker rm -f "\$next_container" >/dev/null 2>&1 || true
+          sudo docker run -d \
+            --name "\$next_container" \
+            --env-file "\$app_dir/.env" \
+            "\$image_tag"
+
+          for attempt in \$(seq 1 30); do
+            status="\$(sudo docker inspect -f '{{.State.Health.Status}}' "\$next_container" 2>/dev/null || true)"
+            if [ "\$status" = "healthy" ]; then
+              break
+            fi
+            if [ "\$status" = "unhealthy" ]; then
+              sudo docker logs --tail=100 "\$next_container"
+              exit 1
+            fi
+            sleep 2
+          done
+
+          if [ "\$(sudo docker inspect -f '{{.State.Health.Status}}' "\$next_container")" != "healthy" ]; then
+            sudo docker logs --tail=100 "\$next_container"
+            exit 1
+          fi
+
+          sudo docker rm -f "\$container_name" >/dev/null 2>&1 || true
+          sudo docker rm -f "\$next_container"
+          sudo docker run -d \
+            --name "\$container_name" \
+            --restart unless-stopped \
+            --env-file "\$app_dir/.env" \
+            -p "\$host_port:\$container_port" \
+            "\$image_tag"
+
+          for attempt in \$(seq 1 30); do
+            if curl -fsS "http://127.0.0.1:\$host_port/health"; then
+              sudo docker image prune -af --filter "until=168h" >/dev/null 2>&1 || true
+              exit 0
+            fi
+            sleep 2
+          done
+
+          sudo docker logs --tail=100 "\$container_name"
+          exit 1
+          REMOTE
