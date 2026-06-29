@@ -94,7 +94,27 @@ jobs:
 
       - name: Upload environment file
         run: |
-          printf '%s' "$PROD_ENV_B64" | base64 -d > /tmp/alphapayy.env
+          printf '%s' "$PROD_ENV_B64" | base64 -d > /tmp/alphapayy.env.raw
+          python3 - <<'PY'
+          from pathlib import Path
+
+          source = Path("/tmp/alphapayy.env.raw")
+          target = Path("/tmp/alphapayy.env")
+          normalized_lines = []
+
+          for line in source.read_text().splitlines():
+              if not line or line.lstrip().startswith("#") or "=" not in line:
+                  normalized_lines.append(line)
+                  continue
+
+              key, value = line.split("=", 1)
+              key = key.strip()
+              if not key or any(char.isspace() for char in key):
+                  raise SystemExit(f"Invalid environment key: {key!r}")
+              normalized_lines.append(f"{key}={value}")
+
+          target.write_text("\n".join(normalized_lines) + "\n")
+          PY
           chmod 600 /tmp/alphapayy.env
           scp -i ~/.ssh/deploy_key -P "$DEPLOY_PORT" /tmp/alphapayy.env "$DEPLOY_USER@$DEPLOY_HOST:/tmp/alphapayy.env"
 
