@@ -53,6 +53,40 @@ pip install -r requirements.txt
 uvicorn graph_standalone_app.server:app --host 0.0.0.0 --port 8090 --reload
 ```
 
+## Docker
+
+Build and run the backend API locally:
+
+```bash
+docker build -t graph-agent-standalone:local .
+docker run --rm --env-file .env -p 8090:8090 graph-agent-standalone:local
+```
+
+Or use Docker Compose:
+
+```bash
+docker compose up --build
+```
+
+Health check:
+
+```bash
+curl http://localhost:8090/health
+```
+
+The image runs `graph_standalone_app.server:app` with Uvicorn on port `8090`.
+Set `PORT` or `WEB_CONCURRENCY` to override the default container runtime settings.
+
+### Automated image builds
+
+GitHub Actions builds the Docker image on pull requests and pushes to `main`.
+For `main` pushes, it publishes to GitHub Container Registry:
+
+```text
+ghcr.io/saddevv/alphapayy:latest
+ghcr.io/saddevv/alphapayy:sha-<commit>
+```
+
 ## Execution modes
 
 The Graph agent supports two execution modes:
